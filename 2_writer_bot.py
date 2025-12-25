@@ -1,0 +1,352 @@
+import os
+import time
+import sys
+import datetime
+import threading
+from openai import OpenAI
+
+# --- 1. 全局配置区 ---
+MODEL_NAME = "gemini-3-pro-preview"
+TIMEOUT_SECONDS = 1200 # 20分钟超时熔断
+client = None
+START_WORK_TIME = time.time()
+
+# --- 2. 品牌与视觉工具 ---
+
+def print_brand_header():
+    print(r"""
+    ****************************************************
+    * 🌟 奥特曼空投研究院专属写作引擎 V5.1 🌟      *
+    * Ultraman Airdrop Research Institute       *
+    ****************************************************
+    """)
+
+def print_brand_end():
+    print(r"""
+           / \      / \
+          /   \____/   \   <-- 光之凝视
+         /  (O)    (O)  \
+        |                |
+        | 奥特曼空投研究院 |
+        |    pxm_chain   |
+         \              /
+          \____________/
+             |  |  |
+             |_ |_ |
+      
+    ✨ 任务完成！光之巨人已停止工作。
+    """)
+
+def log(msg):
+    """打印带时间戳的日志"""
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+def get_work_duration():
+    """计算工作时长"""
+    seconds = int(time.time() - START_WORK_TIME)
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    return f"{h}小时 {m}分 {s}秒"
+
+def heartbeat(stop_event, subtitle=""):
+    """心跳线程：每15秒报时"""
+    start_wait = time.time()
+    while not stop_event.is_set():
+        time.sleep(1)
+        elapsed = int(time.time() - start_wait)
+        if elapsed > 0 and elapsed % 15 == 0:
+            sys.stdout.write(f"\r⏳ [奥特曼充能中...] AI已思考 {elapsed} 秒... ({subtitle})   ")
+            sys.stdout.flush()
+
+def countdown(seconds, message="冷却中"):
+    for i in range(seconds, 0, -1):
+        sys.stdout.write(f"\r⏳ [系统冷却] {message}: {i}秒... ")
+        sys.stdout.flush()
+        time.sleep(1)
+    sys.stdout.write(f"\r✅ {message}结束!        \n")
+
+def read_file(path):
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+# --- 3. 核心锁机制与完结处理 ---
+
+def is_locked(folder_path):
+    return os.path.exists(os.path.join(folder_path, "writing.lock"))
+
+def lock_book(folder_path):
+    with open(os.path.join(folder_path, "writing.lock"), "w") as f:
+        f.write("LOCKED")
+
+def unlock_book(folder_path):
+    lock_path = os.path.join(folder_path, "writing.lock")
+    if os.path.exists(lock_path):
+        os.remove(lock_path)
+
+def mark_book_as_finished(folder_path):
+    """🔥 新增功能：完结封存"""
+    try:
+        # 1. 确保先解锁
+        unlock_book(folder_path)
+        
+        # 2. 构造新名字 (加前缀 【已完结】)
+        # 这样下次扫描 "Book_" 开头时就会自动忽略它
+        if folder_path.endswith("/"): folder_path = folder_path[:-1]
+        
+        base_name = os.path.basename(folder_path)
+        dir_name = os.path.dirname(folder_path)
+        
+        new_folder_name = f"【已完结】_{base_name}"
+        new_full_path = os.path.join(dir_name, new_folder_name)
+        
+        # 3. 重命名
+        os.rename(folder_path, new_full_path)
+        
+        print("\n" + "="*50)
+        print(f"🎉 恭喜！本书已全部写完！")
+        print(f"📁 文件夹已自动更名为: {new_folder_name}")
+        print(f"🙈 (下次启动时，系统将自动忽略此书)")
+        print("="*50 + "\n")
+        
+    except Exception as e:
+        print(f"\n⚠️ 完结改名失败 (可能是文件夹被打开了): {e}")
+
+# --- 4. AI 写作核心 (人类拟态版) ---
+
+def generate_chapter_robust(chapter_num, outline, prev_summary, prev_text_tail, bible):
+    global client
+    
+    clean_outline = outline.replace("\n", " ").strip()
+    subtitle = clean_outline[:20] + "..." if len(clean_outline) > 20 else clean_outline
+
+    system_prompt = """
+    你是一位混迹网文圈10年的白金大神（人类），擅长用“极具网感”和“沉浸式”的笔法写作。
+    你的目标是：写出的文字完全看不出是AI生成的，必须像一个老练的、甚至有点油滑的人类作者。
+
+    【🚫 绝对禁令（触发即死）】：
+    1. 禁止使用“综上所述”、“总而言之”、“与此同时”、“值得一提的是”等论文/新闻连接词。
+    2. 禁止在结尾升华主题或讲大道理。
+    3. 禁止使用“翻译腔”。
+    4. 禁止用Markdown格式（如**加粗**、#标题）。
+
+    【✨ 人类拟态指南】：
+    1. **口语化**：多用短句，多用感叹词，多用“骚话”或心里吐槽。
+    2. **Show, Don't Tell**：不要直接写“他很害怕”，要写“他端茶杯的手抖了一下，茶水溅湿了裤裆”。
+    3. **断章狗**：结尾必须卡在最关键的冲突点，让读者急得想寄刀片。
+    4. **感官轰炸**：每段至少包含一个视觉、听觉或嗅觉描写。
+    
+    【硬性指标】：
+    字数必须在 2300 - 2800 字之间，量大管饱。
+    """
+    
+    user_prompt = f"""
+    【世界观设定】：
+    {bible[:1500]}...
+
+    【前情提要】：
+    {prev_summary}
+
+    【上一章结尾（请无缝接上这个语气，不要断裂）】：
+    “......{prev_text_tail}”
+
+    【本章任务】：
+    第 {chapter_num} 章：{outline}
+
+    👉 请开始正文创作（保持松弛感，多用对话推动剧情）：
+    """
+
+    attempt = 0
+    while True:
+        attempt += 1
+        stop_heartbeat = threading.Event()
+        t = threading.Thread(target=heartbeat, args=(stop_heartbeat, subtitle))
+        t.daemon = True
+        
+        try:
+            log(f"🎬 第 {chapter_num} 章：『{subtitle}』 (第 {attempt} 次尝试)...")
+            t.start()
+            
+            response = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.85, 
+                presence_penalty=0.6, 
+                timeout=TIMEOUT_SECONDS 
+            )
+            
+            stop_heartbeat.set()
+            t.join() 
+            sys.stdout.write("\r" + " " * 80 + "\r")
+            
+            content = response.choices[0].message.content
+            
+            current_len = len(content)
+            if content and current_len >= 1500:
+                log(f"✅ 剧情生成完毕 (字数: {current_len})")
+                return content
+            else:
+                log(f"⚠️ 能量不足 ({current_len}字 < 1500字)，重写中...")
+                time.sleep(2)
+                continue
+
+        except KeyboardInterrupt:
+            stop_heartbeat.set()
+            raise KeyboardInterrupt 
+            
+        except Exception as e:
+            stop_heartbeat.set()
+            t.join()
+            sys.stdout.write("\r" + " " * 80 + "\r")
+            
+            error_msg = str(e)
+            log(f"❌ 发生错误: {error_msg}")
+            
+            wait_time = 10
+            if "429" in error_msg:
+                log(">>> 触发限流，奥特曼正在充能...")
+                wait_time = 60
+            elif "timeout" in error_msg.lower():
+                log(f">>> 响应超时，重启光线技能...")
+                wait_time = 5
+            
+            countdown(wait_time, "等待系统恢复")
+
+def summarize_chapter(content):
+    try:
+        prompt = f"请用200字总结以下章节的关键剧情：\n\n{content[:2000]}"
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": prompt}],
+            timeout=60
+        )
+        return response.choices[0].message.content
+    except:
+        return "（摘要生成失败，沿用旧记忆）"
+
+# --- 5. 主程序 ---
+
+def init_client_dynamic():
+    global client
+    print("\n🔐 --- 身份验证 ---")
+    
+    api_key = input("请输入 API Key: ").strip()
+    while not api_key:
+        api_key = input("请输入 API Key: ").strip()
+    
+    default_url = "http://172.96.160.216:3000/v1"
+    base_url = input(f"Base URL (回车默认 {default_url}): ").strip() or default_url
+    
+    client = OpenAI(api_key=api_key, base_url=base_url)
+
+def main_writer():
+    try:
+        print_brand_header()
+        init_client_dynamic()
+        
+        print(f"\n⚡️ 超时熔断设定: {TIMEOUT_SECONDS} 秒")
+        
+        # 扫描书籍 (只识别 Book_ 开头的，忽略 【已完结】_Book_ 开头的)
+        all_books = [d for d in os.listdir('.') if os.path.isdir(d) and d.startswith("Book_")]
+        all_books.sort(reverse=True)
+        
+        if not all_books:
+            print("❌ 没有找到任何待写书籍项目！(已完结的书籍已被自动隐藏)")
+            return
+
+        available_books = []
+        print("\n📚 待写书籍列表：")
+        for i, book in enumerate(all_books):
+            status = "🟢 空闲"
+            if is_locked(book):
+                status = "🔴 锁定中"
+            print(f"[{i+1}] {status} : {book}")
+            if not is_locked(book):
+                available_books.append(book)
+
+        print("-" * 30)
+        
+        choice = input("\n请选择序号 (输入 'auto' 自动接管): ").strip()
+        folder_path = ""
+        
+        if choice.lower() == 'auto':
+            if not available_books:
+                print("❌ 所有书都在忙！")
+                return
+            folder_path = available_books[0]
+        else:
+            if choice.isdigit() and 1 <= int(choice) <= len(all_books):
+                target_book = all_books[int(choice)-1]
+                if is_locked(target_book):
+                    confirm = input("⚠️ 此书已锁定。强制接管？(y/n): ")
+                    if confirm.lower() != 'y': return
+                    unlock_book(target_book)
+                folder_path = target_book
+            else:
+                return
+
+        lock_book(folder_path)
+        print(f"\n🔒 已锁定项目：{folder_path}")
+        print(f"🚀 奥特曼光线引擎启动，开始作业...")
+        
+        bible = read_file(f"{folder_path}/bible.txt")
+        outline_raw = read_file(f"{folder_path}/outline.txt")
+        
+        if not bible or not outline_raw:
+            print("❌ 资料缺失！")
+            unlock_book(folder_path)
+            return
+            
+        outlines = [line.strip() for line in outline_raw.split('\n') if line.strip()]
+        
+        prev_summary = "故事开始。"
+        prev_tail = "无"
+        
+        # --- 循环写作 ---
+        for i, line_content in enumerate(outlines):
+            chapter_num = i + 1
+            file_name = f"{folder_path}/chapters/第{chapter_num}章.txt"
+            
+            if os.path.exists(file_name):
+                clean_outline = line_content.replace("\n", " ").strip()
+                subtitle = clean_outline[:20] + "..."
+                print(f"[第{chapter_num}章] ✅ 已完成：『{subtitle}』")
+                
+                content = read_file(file_name)
+                prev_tail = content[-500:] if content else "无"
+                continue
+            
+            content = generate_chapter_robust(chapter_num, line_content, prev_summary, prev_tail, bible)
+            
+            with open(file_name, "w", encoding="utf-8") as f:
+                f.write(content)
+            
+            prev_tail = content[-500:]
+            print(f"    └── 正在更新剧情记忆...", end="\r")
+            prev_summary = summarize_chapter(content)
+            
+            duration = get_work_duration()
+            log(f"✅ 第 {chapter_num} 章完稿！(累计工时: {duration})")
+            
+            time.sleep(3)
+
+        # 🔥 循环结束后，执行完结封存逻辑
+        mark_book_as_finished(folder_path)
+        
+        print_brand_end() 
+
+    except KeyboardInterrupt:
+        print("\n👋 用户手动停止")
+        if 'folder_path' in locals() and folder_path:
+            unlock_book(folder_path)
+    except Exception as e:
+        print(f"\n❌ 致命错误: {e}")
+        if 'folder_path' in locals() and folder_path:
+            unlock_book(folder_path)
+
+if __name__ == "__main__":
+    main_writer()
