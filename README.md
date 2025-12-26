@@ -47,6 +47,7 @@
 cd ~/Local_Projects/Novel_Matrix
 
 # 2. 激活奥特曼虚拟环境 (必须!)
+python3 -m venv venv
 source venv/bin/activate
 
 # 3. 安装依赖 (仅首次)
