@@ -52,3 +52,36 @@ source venv/bin/activate
 
 # 3. 安装依赖 (仅首次)
 pip install openai
+
+-------------
+
+如果出错：🛠️ 彻底修复步骤
+1. 退出当前的异常环境
+
+Bash
+
+deactivate
+(如果提示 command not found 也没关系，继续下一步)
+
+2. 删掉旧的、坏掉的虚拟环境文件夹
+
+Bash
+
+rm -rf venv
+3. 创建一个全新的虚拟环境
+
+Bash
+
+python3 -m venv venv
+4. 激活新环境
+
+Bash
+
+source venv/bin/activate
+5. 重新安装 openai 包
+
+Bash
+
+pip install openai
+✅ 验证是否修好
+等上面第 5 步跑完（看到 Successfully installed...），你再运行脚本：
